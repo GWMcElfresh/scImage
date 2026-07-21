@@ -16,6 +16,16 @@ import ot
 from .hvg import select_hvg
 
 
+def _is_anndata(obj) -> bool:
+    """Return True if *obj* looks like an ``AnnData`` instance."""
+    return (
+        hasattr(obj, "obs")
+        and hasattr(obj, "var")
+        and hasattr(obj, "X")
+        and hasattr(obj, "var_names")
+    )
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -132,6 +142,11 @@ class ScImageLayout:
     :meth:`fit`) and then used to transform any number of cells (via
     :meth:`transform`).  It can be persisted with :meth:`save` / :meth:`load`.
 
+    When fitted from an :class:`anndata.AnnData` object the selected HVG names
+    are stored in :attr:`gene_names` and used for **gene-name-based alignment**
+    during :meth:`transform`, so the layout can be applied to any AnnData whose
+    ``var_names`` include the same genes even if their column order differs.
+
     Attributes
     ----------
     projection : float32 array of shape ``(n_genes, n_pixels)``
@@ -144,6 +159,8 @@ class ScImageLayout:
         Per-gene standard deviation used for z-scoring.
     grid_size : int
         Side length of the square image grid.
+    gene_names : str array of shape ``(n_genes,)`` or None
+        Names of the selected HVGs (populated when fitting from AnnData).
     """
 
     #: Default grid side length (104 × 104 = 10 816 pixels / genes).
@@ -156,12 +173,16 @@ class ScImageLayout:
         gene_mean: np.ndarray,
         gene_std: np.ndarray,
         grid_size: int = 104,
+        gene_names: np.ndarray | None = None,
     ) -> None:
         self.projection = np.asarray(projection, dtype=np.float32)
         self.gene_indices = np.asarray(gene_indices, dtype=np.int64)
         self.gene_mean = np.asarray(gene_mean, dtype=np.float32)
         self.gene_std = np.asarray(gene_std, dtype=np.float32)
         self.grid_size = int(grid_size)
+        self.gene_names: np.ndarray | None = (
+            np.asarray(gene_names, dtype=str) if gene_names is not None else None
+        )
 
     # ------------------------------------------------------------------
     # Properties
@@ -193,13 +214,16 @@ class ScImageLayout:
         loess_frac: float = 0.3,
         n_cells_sample: int | None = None,
     ) -> "ScImageLayout":
-        """Compute the layout from an expression matrix.
+        """Compute the layout from an expression matrix or AnnData object.
 
         Parameters
         ----------
         X:
             Expression matrix of shape ``(n_cells, n_all_genes)`` — a dense
-            NumPy array or a SciPy sparse matrix.
+            NumPy array, a SciPy sparse matrix, or an
+            :class:`anndata.AnnData` object.  When an AnnData is supplied its
+            ``var_names`` are stored in :attr:`gene_names` and used for
+            gene-name-based alignment in subsequent :meth:`transform` calls.
         n_genes:
             Number of HVGs to select.  Defaults to ``grid_size ** 2``.
         grid_size:
@@ -222,6 +246,12 @@ class ScImageLayout:
         """
         if n_genes is None:
             n_genes = grid_size ** 2
+
+        # Unwrap AnnData — capture gene names before extracting the matrix
+        gene_names_all: np.ndarray | None = None
+        if _is_anndata(X):
+            gene_names_all = np.asarray(X.var_names)
+            X = X.X  # may be sparse
 
         # Optional cell sub-sampling
         if n_cells_sample is not None and X.shape[0] > n_cells_sample:
@@ -251,18 +281,25 @@ class ScImageLayout:
         # Compute GW layout
         P = compute_gw_layout(X_hvg, grid_size=grid_size, n_iter=n_iter, seed=seed)
 
-        return cls(P, hvg_indices, gene_mean, gene_std, grid_size=grid_size)
+        # Resolve HVG gene names when available (e.g. from AnnData)
+        gene_names: np.ndarray | None = (
+            gene_names_all[hvg_indices] if gene_names_all is not None else None
+        )
+
+        return cls(P, hvg_indices, gene_mean, gene_std, grid_size=grid_size, gene_names=gene_names)
 
     # ------------------------------------------------------------------
     # Transform
     # ------------------------------------------------------------------
 
-    def transform(self, expression: np.ndarray) -> np.ndarray:
+    def transform(self, expression) -> np.ndarray:
         """Transform cell expression(s) into scImages.
 
         For each cell the raw expression vector is:
 
-        1. Subset to the *n_genes* HVG columns.
+        1. Subset to the *n_genes* HVG columns (by gene name when the layout
+           was fitted from AnnData and the input is also AnnData; by index
+           otherwise).
         2. ``log1p``-transformed.
         3. z-scored gene-wise using the stored mean and standard deviation.
         4. Projected via ``y = Pᵀ · ẽ``.
@@ -273,9 +310,13 @@ class ScImageLayout:
         Parameters
         ----------
         expression:
-            Array of shape ``(n_all_genes,)`` for a single cell or
-            ``(n_cells, n_all_genes)`` for a batch.  The column ordering must
-            match the one used during :meth:`fit`.
+            Any of the following:
+
+            * Dense array of shape ``(n_all_genes,)`` or
+              ``(n_cells, n_all_genes)``.
+            * SciPy sparse matrix of shape ``(n_cells, n_all_genes)``.
+            * :class:`anndata.AnnData` object — genes are aligned by name
+              when :attr:`gene_names` is set, enabling cross-dataset use.
 
         Returns
         -------
@@ -283,6 +324,14 @@ class ScImageLayout:
             Shape ``(1, H, W)`` for a single cell or ``(n_cells, 1, H, W)``
             for a batch, where ``H = W = grid_size``.
         """
+        already_selected = False  # True when gene selection is done during extraction
+
+        if _is_anndata(expression):
+            expression, already_selected = self._extract_adata_expression(expression)
+        elif hasattr(expression, "toarray"):
+            # SciPy sparse matrix — convert to dense
+            expression = expression.toarray()
+
         expression = np.asarray(expression, dtype=np.float32)
         single_cell = expression.ndim == 1
         if single_cell:
@@ -291,8 +340,11 @@ class ScImageLayout:
         n_cells = expression.shape[0]
         H = W = self.grid_size
 
-        # 1 & 2. Select HVG columns and log1p-transform
-        X_hvg = np.log1p(expression[:, self.gene_indices])
+        # 1 & 2. Select HVG columns (if not already done) and log1p-transform
+        if already_selected:
+            X_hvg = np.log1p(expression)
+        else:
+            X_hvg = np.log1p(expression[:, self.gene_indices])
 
         # 3. Z-score gene-wise
         X_z = (X_hvg - self.gene_mean) / self.gene_std  # (n_cells, G)
@@ -308,6 +360,69 @@ class ScImageLayout:
 
         return images[0] if single_cell else images
 
+    def transform_adata(self, adata, obsm_key: str = "X_scimage"):
+        """Transform an AnnData object and store scImages in ``adata.obsm``.
+
+        Images are stored as a ``float16`` matrix of shape
+        ``(n_cells, grid_size ** 2)`` (spatial dimensions flattened) under
+        ``adata.obsm[obsm_key]``.  The AnnData is modified **in place** and
+        also returned for convenience.
+
+        Parameters
+        ----------
+        adata : anndata.AnnData
+            Annotated data matrix.
+        obsm_key : str
+            Key used to store the images in ``adata.obsm``.
+
+        Returns
+        -------
+        adata : anndata.AnnData
+            The input AnnData with images added to ``adata.obsm[obsm_key]``.
+        """
+        images = self.transform(adata)  # (n_cells, 1, H, W)
+        adata.obsm[obsm_key] = images.reshape(images.shape[0], -1)
+        return adata
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _extract_adata_expression(self, adata) -> tuple[np.ndarray, bool]:
+        """Extract expression from AnnData, aligning genes by name if possible.
+
+        Parameters
+        ----------
+        adata : anndata.AnnData
+            Annotated data object.
+
+        Returns
+        -------
+        expression : float32 ndarray of shape ``(n_cells, n_genes_out)``
+        already_selected : bool
+            ``True`` when *expression* is already restricted to the HVG
+            columns in the layout's gene order (i.e. gene selection should be
+            skipped in :meth:`transform`).
+        """
+        X_raw = adata.X
+        if hasattr(X_raw, "toarray"):
+            X_raw = X_raw.toarray()
+        X_raw = np.asarray(X_raw, dtype=np.float32)
+
+        if self.gene_names is not None:
+            var_names = np.asarray(adata.var_names)
+            name_to_col = {name: i for i, name in enumerate(var_names)}
+            missing = [g for g in self.gene_names if g not in name_to_col]
+            if missing:
+                raise ValueError(
+                    f"{len(missing)} HVG gene(s) not found in adata.var_names: "
+                    f"{missing[:5]}{'...' if len(missing) > 5 else ''}"
+                )
+            col_indices = np.array([name_to_col[g] for g in self.gene_names], dtype=np.intp)
+            return X_raw[:, col_indices], True
+
+        return X_raw, False
+
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
@@ -321,14 +436,16 @@ class ScImageLayout:
             Destination file path.  The ``.npz`` extension is appended if
             absent.
         """
-        np.savez_compressed(
-            path,
+        arrays: dict = dict(
             projection=self.projection,
             gene_indices=self.gene_indices,
             gene_mean=self.gene_mean,
             gene_std=self.gene_std,
             grid_size=np.array([self.grid_size], dtype=np.int64),
         )
+        if self.gene_names is not None:
+            arrays["gene_names"] = self.gene_names
+        np.savez_compressed(path, **arrays)
 
     @classmethod
     def load(cls, path: str) -> "ScImageLayout":
@@ -348,10 +465,12 @@ class ScImageLayout:
         if not path.endswith(".npz"):
             path = path + ".npz"
         data = np.load(path)
+        gene_names = data["gene_names"] if "gene_names" in data else None
         return cls(
             projection=data["projection"],
             gene_indices=data["gene_indices"],
             gene_mean=data["gene_mean"],
             gene_std=data["gene_std"],
             grid_size=int(data["grid_size"][0]),
+            gene_names=gene_names,
         )
