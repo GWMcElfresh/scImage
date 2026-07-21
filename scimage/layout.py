@@ -251,7 +251,7 @@ class ScImageLayout:
         gene_names_all: np.ndarray | None = None
         if _is_anndata(X):
             gene_names_all = np.asarray(X.var_names)
-            X = X.X  # may be sparse
+            X = X.X  # X is now the expression matrix (dense array or sparse)
 
         # Optional cell sub-sampling
         if n_cells_sample is not None and X.shape[0] > n_cells_sample:
@@ -418,7 +418,9 @@ class ScImageLayout:
                     f"{len(missing)} HVG gene(s) not found in adata.var_names: "
                     f"{missing[:5]}{'...' if len(missing) > 5 else ''}"
                 )
-            col_indices = np.array([name_to_col[g] for g in self.gene_names], dtype=np.intp)
+            col_indices = np.array(
+                [name_to_col[g] for g in self.gene_names], dtype=np.intp
+            )
             return X_raw[:, col_indices], True
 
         return X_raw, False
@@ -436,13 +438,13 @@ class ScImageLayout:
             Destination file path.  The ``.npz`` extension is appended if
             absent.
         """
-        arrays: dict = dict(
-            projection=self.projection,
-            gene_indices=self.gene_indices,
-            gene_mean=self.gene_mean,
-            gene_std=self.gene_std,
-            grid_size=np.array([self.grid_size], dtype=np.int64),
-        )
+        arrays = {
+            "projection": self.projection,
+            "gene_indices": self.gene_indices,
+            "gene_mean": self.gene_mean,
+            "gene_std": self.gene_std,
+            "grid_size": np.array([self.grid_size], dtype=np.int64),
+        }
         if self.gene_names is not None:
             arrays["gene_names"] = self.gene_names
         np.savez_compressed(path, **arrays)

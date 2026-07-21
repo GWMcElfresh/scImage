@@ -93,7 +93,7 @@ def make_adata(
 
     obs = pd.DataFrame(
         {"cell_type": [f"type_{i % 3}" for i in range(n_cells)]},
-        index=[f"cell_{i}" for i in range(n_cells)],
+        index=cell_names,
     )
     var = pd.DataFrame(
         {"gene_id": gene_names},
@@ -208,19 +208,23 @@ class TestTransformWithAnnData:
 
         images_adata = layout.transform(adata)
 
-        # Build a plain array using the same HVG gene order via gene_names
+        # Build a plain array already aligned to the HVG gene order using gene_names.
         var_names = list(adata.var_names)
         name_to_col = {n: i for i, n in enumerate(var_names)}
         col_indices = np.array([name_to_col[g] for g in layout.gene_names])
         X_aligned = np.asarray(adata.X)[:, col_indices]
-        # Replace gene_names with None temporarily to use index-based path
-        saved = layout.gene_names
-        layout.gene_names = None
-        layout_indices_saved = layout.gene_indices.copy()
-        layout.gene_indices = np.arange(len(col_indices), dtype=np.int64)
-        images_plain = layout.transform(X_aligned)
-        layout.gene_names = saved
-        layout.gene_indices = layout_indices_saved
+
+        # Create an equivalent layout with sequential gene_indices so the
+        # plain-array path (no gene_names) applies the same transform on the
+        # pre-aligned matrix without mutating the original layout.
+        layout_seq = ScImageLayout(
+            projection=layout.projection,
+            gene_indices=np.arange(len(layout.gene_names), dtype=np.int64),
+            gene_mean=layout.gene_mean,
+            gene_std=layout.gene_std,
+            grid_size=layout.grid_size,
+        )
+        images_plain = layout_seq.transform(X_aligned)
 
         np.testing.assert_array_equal(images_adata, images_plain)
 
