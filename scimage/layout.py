@@ -337,12 +337,16 @@ class ScImageLayout:
         Parameters
         ----------
         path:
-            Path to the ``.npz`` file.
+            Path to the ``.npz`` file.  The ``.npz`` extension is appended
+            automatically if absent, so the path passed to :meth:`save` can
+            be passed here without modification.
 
         Returns
         -------
         ScImageLayout
         """
+        if not path.endswith(".npz"):
+            path = path + ".npz"
         data = np.load(path)
         return cls(
             projection=data["projection"],

@@ -145,7 +145,7 @@ def test_save_load_roundtrip():
     with tempfile.TemporaryDirectory() as tmpdir:
         path = os.path.join(tmpdir, "layout")
         layout.save(path)
-        loaded = ScImageLayout.load(path + ".npz")
+        loaded = ScImageLayout.load(path)
 
     assert loaded.grid_size == layout.grid_size
     np.testing.assert_array_equal(loaded.gene_indices, layout.gene_indices)
@@ -162,7 +162,7 @@ def test_transform_same_after_save_load():
     with tempfile.TemporaryDirectory() as tmpdir:
         path = os.path.join(tmpdir, "layout")
         layout.save(path)
-        loaded = ScImageLayout.load(path + ".npz")
+        loaded = ScImageLayout.load(path)
 
     imgs_after = loaded.transform(expr)
     np.testing.assert_array_equal(imgs_before, imgs_after)
